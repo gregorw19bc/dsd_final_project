@@ -7,6 +7,7 @@ from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+import email
 
 from helper_methods import *
 
@@ -22,6 +23,10 @@ def load_state():
 
 def save_state(state):
     json.dump(state, open(STATE_FILE, 'w'))
+
+def clear_state():
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
 
 # --- DH keypair generator ---
 def generate_keypair(p, g):
@@ -82,34 +87,61 @@ def send_public_key(recipient):
 
 # Process incoming DH public key and derive shared secret 
 def process_incoming_public_key():
-    svc = get_gmail_service()
+    svc   = get_gmail_service()
     state = load_state()
-    p = int(state['p'])
-    priv = int(state['priv'])
 
+    # pull or init our “seen” list
+    # just makes sure we don't reuse keys
+    seen = set(state.get('processed_keys', []))
+
+    # grab all unread DH-KEYs
     res = svc.users().messages().list(
-        userId='me', q='subject:SECURE-DH-KEY is:unread'
+        userId='me',
+        q='subject:SECURE-DH-KEY is:unread'
     ).execute()
 
     for m in res.get('messages', []):
-        full  = svc.users().messages().get(
-              userId='me', id=m['id'], format='full'
-              ).execute()
-        raw_body = full['payload']['body']['data']
-        partner_pub_bytes = Base64_to_bytes(raw_body + '===')
-        partner_pub       = bytes_to_int(partner_pub_bytes)
+        mid = m['id']
+        if mid in seen:
+            continue
 
-        # compute shared secret
+        # fetch raw MIME, peel out the exact Base64 text
+        full = svc.users().messages().get(
+            userId='me', id=mid, format='raw'
+        ).execute()
+        raw_b64 = full['raw']
+        raw_bytes = base64.urlsafe_b64decode(raw_b64)
+        msg = email.message_from_bytes(raw_bytes)
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == 'text/plain':
+                    pub_b64 = part.get_payload(decode=True).decode()
+                    break
+        else:
+            pub_b64 = msg.get_payload(decode=True).decode()
+
+        partner_pub = bytes_to_int(Base64_to_bytes(pub_b64))
+        priv = int(state['priv'])
+        p = int(state['p'])
+
+        # --- derive & save shared secret ---
         shared = pow(partner_pub, priv, p)
         state['shared'] = str(shared)
+
+        # mark this ID “done” so we never reuse it
+        seen.add(mid)
+        state['processed_keys'] = list(seen)
+
         save_state(state)
 
-        # mark read
+        # mark it read in Gmail
         svc.users().messages().modify(
-            userId='me', id=m['id'],
-            body={'removeLabelIds': ['UNREAD']}
+            userId='me', id=mid,
+            body={'removeLabelIds':['UNREAD']}
         ).execute()
-        print("Derived shared secret.")
+
+        break
 
 # Send encrypted + authenticated message 
 def send_secure_message(recipient, plaintext):
@@ -156,10 +188,11 @@ def process_incoming_messages():
         mac = payload['mac']
 
         blob = nonce + cipher
+        new_mac = create_mac(key_bytes, blob)
         if not verify_mac(key_bytes, blob, mac):
             print("MAC failed, skipping.")
         else:
-            ks    = generate_keystream(key_bytes, len(cipher), nonce)
+            ks = generate_keystream(key_bytes, len(cipher), nonce)
             plain = xor_bytes(cipher, ks)
             print("Decrypted message:", bytes_to_str(plain))
 
@@ -170,6 +203,7 @@ def process_incoming_messages():
 
 # --- Receiver main loop ---
 def main_receiver():
+    clear_state()
     print("Secure Gmail DH Chat — Receiver\n")
     recipient = input("Initiator's email: ").strip()
     if not recipient:
