@@ -2,39 +2,52 @@ import os
 import json
 import time
 import secrets
+import email
+import base64
 from email.mime.text import MIMEText
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import email
+from cryptography.hazmat.primitives.asymmetric import dh
 
-from helper_methods import *
+from helper_methods import (
+    bytes_to_Base64,
+    Base64_to_bytes,
+    int_to_bytes,
+    generate_keystream,
+    xor_bytes,
+    bytes_to_str,
+    create_mac,
+    verify_mac
+)
 
-# SCOPES for send, read, modify
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 STATE_FILE = 'state.json'
 CRED_FILE = 'credentials.json'
 POLL_INTERVAL = 5
 
-# --- State management ---
+# Load persistent DH/chat state from disk
 def load_state():
     return json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
 
+# Save our DH state back to disk
 def save_state(state):
-    json.dump(state, open(STATE_FILE, 'w'))
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
 
+# Remove any existing state file
 def clear_state():
     if os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
 
-# --- DH keypair generator ---
+# Produce DH private/public keypair with given p, g
 def generate_keypair(p, g):
     priv = secrets.randbelow(p)
     pub = pow(g, priv, p)
     return priv, pub
 
-# --- Gmail API boilerplate ---
+# Authenticate and return Gmail API client
 def get_gmail_service():
     creds = None
     if os.path.exists('token.json'):
@@ -46,66 +59,32 @@ def get_gmail_service():
             f.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 
+# Build a raw Gmail message
 def create_message(to, subject, body):
     msg = MIMEText(body)
     msg['to'] = to
     msg['subject'] = subject
-    raw = bytes_to_Base64(msg.as_bytes())
-    return {'raw': raw}
+    return {'raw': bytes_to_Base64(msg.as_bytes())}
 
+# Send the message via Gmail API
 def send_message(service, message):
     sent = service.users().messages().send(userId='me', body=message).execute()
     print("Sent message ID:", sent['id'])
 
-# Aend our DH public key
-def send_public_key(recipient):
+# Step 1 (receiver): poll for initiator's {p,g,pub}, generate own keypair, derive shared, send back JSON {pub}
+def process_incoming_parameters_and_pub(initiator):
     svc = get_gmail_service()
     state = load_state()
-
-    if 'priv' not in state:
-        # RFC 3526 Group 14 prime
-        p = int(
-            "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
-            "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
-            "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
-            "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16
-        )
-        g = 2
-        priv, pub = generate_keypair(p, g)
-        state.update({'p': str(p), 'g': str(g),
-                      'priv': str(priv), 'pub': str(pub)})
-        save_state(state)
-    else:
-        priv = int(state['priv'])
-        pub  = int(state['pub'])
-
-    # send our public key
-    pub_bytes = int_to_bytes(pub)
-    pub_b64 = bytes_to_Base64(pub_bytes)
-    msg = create_message(recipient, 'SECURE-DH-KEY', pub_b64)
-    send_message(svc, msg)
-
-# Process incoming DH public key and derive shared secret 
-def process_incoming_public_key():
-    svc   = get_gmail_service()
-    state = load_state()
-
-    # pull or init our “seen” list
-    # just makes sure we don't reuse keys
     seen = set(state.get('processed_keys', []))
 
-    # grab all unread DH-KEYs
     res = svc.users().messages().list(
-        userId='me',
-        q='subject:SECURE-DH-KEY is:unread'
+        userId='me', q='subject:SECURE-DH-KEY is:unread'
     ).execute()
-
     for m in res.get('messages', []):
         mid = m['id']
         if mid in seen:
             continue
 
-        # fetch raw MIME, peel out the exact Base64 text
         full = svc.users().messages().get(
             userId='me', id=mid, format='raw'
         ).execute()
@@ -114,58 +93,41 @@ def process_incoming_public_key():
         msg = email.message_from_bytes(raw_bytes)
 
         if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == 'text/plain':
-                    pub_b64 = part.get_payload(decode=True).decode()
-                    break
+            part = next(p for p in msg.walk() if p.get_content_type() == 'text/plain')
+            body = part.get_payload(decode=True).decode()
         else:
-            pub_b64 = msg.get_payload(decode=True).decode()
+            body = msg.get_payload(decode=True).decode()
 
-        partner_pub = bytes_to_int(Base64_to_bytes(pub_b64))
-        priv = int(state['priv'])
-        p = int(state['p'])
+        data = json.loads(body)
+        p = int(data['p'])
+        g = int(data['g'])
+        partner_pub = int(data['pub'])
 
-        # --- derive & save shared secret ---
+        priv, pub = generate_keypair(p, g)
         shared = pow(partner_pub, priv, p)
-        state['shared'] = str(shared)
 
-        # mark this ID “done” so we never reuse it
+        state['p'] = str(p)
+        state['g'] = str(g)
+        state['priv'] = str(priv)
+        state['pub'] = str(pub)
+        state['shared'] = str(shared)
         seen.add(mid)
         state['processed_keys'] = list(seen)
-
         save_state(state)
 
-        # mark it read in Gmail
         svc.users().messages().modify(
             userId='me', id=mid,
-            body={'removeLabelIds':['UNREAD']}
+            body={'removeLabelIds': ['UNREAD']}
         ).execute()
 
+        reply = json.dumps({'pub': str(pub)})
+        msg2 = create_message(initiator, 'SECURE-DH-KEY', reply)
+        send_message(svc, msg2)
+
+        print("Derived shared secret and sent our public key.")
         break
 
-# Send encrypted + authenticated message 
-def send_secure_message(recipient, plaintext):
-    svc = get_gmail_service()
-    state = load_state()
-    shared = int(state['shared'])
-    key_bytes = int_to_bytes(shared)
-
-    nonce = secrets.token_bytes(16)
-    ks = generate_keystream(key_bytes, len(plaintext), nonce)
-    cipher = xor_bytes(str_to_bytes(plaintext), ks)
-
-    blob = nonce + cipher
-    mac = create_mac(key_bytes, blob)
-
-    payload = json.dumps({
-        'nonce':  bytes_to_Base64(nonce),
-        'cipher': bytes_to_Base64(cipher),
-        'mac':    mac
-    })
-    msg = create_message(recipient, 'SECURE-DH-MSG', payload)
-    send_message(svc, msg)
-
-# Process and decrypt incoming secure messages 
+# Step 2 (receiver): poll for secure messages, verify MAC, decrypt, and print
 def process_incoming_messages():
     svc = get_gmail_service()
     state = load_state()
@@ -175,22 +137,20 @@ def process_incoming_messages():
     res = svc.users().messages().list(
         userId='me', q='subject:SECURE-DH-MSG is:unread'
     ).execute()
-
     for m in res.get('messages', []):
         full = svc.users().messages().get(
-                   userId='me', id=m['id'], format='full'
-               ).execute()
+            userId='me', id=m['id'], format='full'
+        ).execute()
         raw_body = full['payload']['body']['data']
-        payload = json.loads(Base64_to_bytes(raw_body + '===').decode())
+        data_json = json.loads(Base64_to_bytes(raw_body + '===').decode())
 
-        nonce = Base64_to_bytes(payload['nonce'])
-        cipher = Base64_to_bytes(payload['cipher'])
-        mac = payload['mac']
-
+        nonce = Base64_to_bytes(data_json['nonce'] + '===')
+        cipher = Base64_to_bytes(data_json['cipher'] + '===')
+        mac = data_json['mac']
         blob = nonce + cipher
-        new_mac = create_mac(key_bytes, blob)
+
         if not verify_mac(key_bytes, blob, mac):
-            print("MAC failed, skipping.")
+            print("MAC verification failed, skipping.")
         else:
             ks = generate_keystream(key_bytes, len(cipher), nonce)
             plain = xor_bytes(cipher, ks)
@@ -201,21 +161,26 @@ def process_incoming_messages():
             body={'removeLabelIds': ['UNREAD']}
         ).execute()
 
-# --- Receiver main loop ---
+# Main loop for the receiver: perform key handshake, then decrypt messages
 def main_receiver():
     clear_state()
     print("Secure Gmail DH Chat — Receiver\n")
-    recipient = input("Initiator's email: ").strip()
-    if not recipient:
+    print("Press CTRL-C to quit\n")
+    initiator = input("Enter initiator's email: ").strip()
+    if not initiator:
         return
 
-    send_public_key(recipient)
-    print(f"Sent DH public key to {recipient}.\n")
+    print(f"Waiting for DH parameters… (poll every {POLL_INTERVAL}s)")
+    while True:
+        process_incoming_parameters_and_pub(initiator)
+        state = load_state()
+        if 'shared' in state:
+            break
+        time.sleep(POLL_INTERVAL)
 
-    print(f"Polling every {POLL_INTERVAL}s...")
+    print("Shared secret established. Listening for secure messages…")
     try:
         while True:
-            process_incoming_public_key()
             process_incoming_messages()
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
